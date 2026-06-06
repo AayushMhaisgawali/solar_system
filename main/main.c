@@ -1,46 +1,70 @@
-#include <stdio.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
+#include "driver/gpio.h"
+#include "driver/i2c.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "esp_log.h"
-
-#include "driver/i2c.h"
-#include "driver/gpio.h"
-
+#include "nrf24_link.h"
+#include "ntc.h"
 #include "sht30.h"
 #include "veml6030.h"
-#include "ntc.h"
-#include "nrf24_link.h"
-
 
 static const char *TAG = "SOLAR_TX";
 
-/* =========================================================
- * I2C CONFIG
- * ========================================================= */
+#define I2C_MASTER_SDA_IO  8
+#define I2C_MASTER_SCL_IO  9
+#define I2C_MASTER_NUM     I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ 100000
 
-#define I2C_MASTER_SDA_IO       8
-#define I2C_MASTER_SCL_IO       9
-#define I2C_MASTER_NUM          I2C_NUM_0
-#define I2C_MASTER_FREQ_HZ      100000
+#define MODEL_COEF      0.02984201f
+#define MODEL_INTERCEPT 0.08106460f
 
-/* =========================================================
- * ML MODEL
- * ========================================================= */
+#define NUM_NTC NRF24_SOLAR_PANEL_COUNT
 
-#define MODEL_COEF       0.02984201f
-#define MODEL_INTERCEPT  0.08106460f
+#define PANEL_RATED_POWER 6600.0f
+#define TEMP_COEFFICIENT  0.00354f
+#define STC_TEMPERATURE   25.0f
 
-#define NUM_NTC          12
+static uint16_t s_packet_sequence;
 
-/* =========================================================
- * I2C INIT
- * ========================================================= */
+static float clamp_float(float value, float min_value, float max_value)
+{
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+static int16_t scale_i16_x100(float value)
+{
+    return (int16_t)lrintf(value * 100.0f);
+}
+
+static uint16_t scale_u16_x100(float value)
+{
+    value = clamp_float(value, 0.0f, 655.35f);
+    return (uint16_t)lrintf(value * 100.0f);
+}
+
+static uint16_t scale_u16_x10(float value)
+{
+    value = clamp_float(value, 0.0f, 6553.5f);
+    return (uint16_t)lrintf(value * 10.0f);
+}
+
+static int32_t scale_i32_x100(float value)
+{
+    return (int32_t)lrintf(value * 100.0f);
+}
 
 static void i2c_master_init(void)
 {
@@ -53,445 +77,181 @@ static void i2c_master_init(void)
         .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
 
-    ESP_ERROR_CHECK(
-        i2c_param_config(
-            I2C_MASTER_NUM,
-            &conf
-        )
-    );
-
-    ESP_ERROR_CHECK(
-        i2c_driver_install(
-            I2C_MASTER_NUM,
-            conf.mode,
-            0,
-            0,
-            0
-        )
-    );
+    ESP_ERROR_CHECK(i2c_param_config(I2C_MASTER_NUM, &conf));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0));
 }
 
-/* =========================================================
- * ML PREDICTION
- * ========================================================= */
-
-static float ml_predict(float lux,
-                        float ntc_temp,
-                        float ambient_temp)
+static float ml_predict(float lux, float ntc_temp, float ambient_temp)
 {
     float irradiance = lux / 120.0f;
-
-    return fabsf(ntc_temp - ambient_temp)
-           + (MODEL_COEF * irradiance)
-           + MODEL_INTERCEPT;
+    return fabsf(ntc_temp - ambient_temp) + (MODEL_COEF * irradiance) + MODEL_INTERCEPT;
 }
 
-/* =========================================================
- * SEND TEXT PACKET
- * ========================================================= */
-
-static bool send_text_packet(uint8_t type,
-                             uint8_t sequence,
-                             uint8_t total,
-                             const char *text)
+static float calculate_dust_index(float measured_temp, float predicted_temp)
 {
-    nrf24_text_packet_t pkt;
+    float delta = predicted_temp - measured_temp;
+    if (delta < 0.0f) {
+        delta = 0.0f;
+    }
+    return clamp_float(delta * 10.0f, 0.0f, 100.0f);
+}
 
-    memset(&pkt, 0, sizeof(pkt));
+static float calculate_solar_power(float irradiance, float panel_temp, float dust_index)
+{
+    float irradiance_factor = clamp_float(irradiance / 1000.0f, 0.0f, 2.0f);
+    float temp_factor = 1.0f - (TEMP_COEFFICIENT * (panel_temp - STC_TEMPERATURE));
+    float dust_factor = 1.0f - clamp_float(dust_index / 100.0f, 0.0f, 1.0f);
 
-    pkt.type = type;
-    pkt.sequence = sequence;
-    pkt.total_packets = total;
+    temp_factor = clamp_float(temp_factor, 0.0f, 1.5f);
+    return PANEL_RATED_POWER * irradiance_factor * temp_factor * dust_factor;
+}
 
-    strncpy(pkt.text,
-            text,
-            NRF24_LABELED_TEXT_SIZE - 1);
+static bool send_panel_packet(uint8_t panel_index,
+                              uint8_t flags,
+                              float measured_temp,
+                              float predicted_temp,
+                              float delta_t,
+                              float dust_index,
+                              float panel_power,
+                              float ambient_temp,
+                              float humidity,
+                              float irradiance)
+{
+    nrf24_solar_panel_packet_t packet;
+    memset(&packet, 0, sizeof(packet));
 
-    bool ok = nrf24_send_payload(
-        (uint8_t *)&pkt,
-        sizeof(pkt)
-    );
+    packet.type = NRF24_PACKET_TYPE_SOLAR_PANEL;
+    packet.sequence = ++s_packet_sequence;
+    packet.panel_index = panel_index;
+    packet.flags = flags;
+    packet.measured_temp_x100 = scale_i16_x100(measured_temp);
+    packet.predicted_temp_x100 = scale_i16_x100(predicted_temp);
+    packet.delta_temp_x100 = scale_i16_x100(delta_t);
+    packet.dust_index_x100 = scale_i16_x100(dust_index);
+    packet.panel_power_x100 = scale_i32_x100(panel_power);
+    packet.sht30_temp_x100 = scale_i16_x100(ambient_temp);
+    packet.sht30_humidity_x100 = scale_u16_x100(humidity);
+    packet.irradiance_x10 = scale_u16_x10(irradiance);
 
-    vTaskDelay(pdMS_TO_TICKS(50));
-
+    bool ok = nrf24_send_solar_panel_packet(&packet);
+    printf("TX Solar PV%u seq=%u %s\n", panel_index, packet.sequence, ok ? "OK" : "FAIL");
+    vTaskDelay(pdMS_TO_TICKS(30));
     return ok;
 }
-
-/* =========================================================
- * SEND ENVIRONMENT DATA
- * ========================================================= */
-
-static void send_environment_data(float temp,
-                                  float hum)
-{
-    char text[32];
-
-    snprintf(text,
-             sizeof(text),
-             "AMB %.1fC HUM %.1f%%",
-             temp,
-             hum);
-
-    send_text_packet(
-        NRF24_PACKET_TYPE_SOLAR_ENV,
-        1,
-        1,
-        text
-    );
-}
-
-/* =========================================================
- * SEND LIGHT DATA
- * ========================================================= */
-
-static void send_light_data(float lux,
-                            float irradiance)
-{
-    char text[32];
-
-    snprintf(text,
-             sizeof(text),
-             "LUX:%.0f IRR:%.1f",
-             lux,
-             irradiance);
-
-    send_text_packet(
-        NRF24_PACKET_TYPE_SOLAR_PV,
-        1,
-        15,
-        text
-    );
-}
-
-/* =========================================================
- * SEND NTC DATA
- * ========================================================= */
-
-static void send_ntc_data(uint8_t index,
-                          float ntc_temp,
-                          float predicted_temp,
-                          float delta_t,
-                          float dust)
-{
-    char text[32];
-
-    snprintf(text,
-             sizeof(text),
-             "PV%d %.1f %.1f %.1f %.1f",
-             index,
-             ntc_temp,
-             predicted_temp,
-             delta_t,
-             dust);
-
-    send_text_packet(
-        NRF24_PACKET_TYPE_SOLAR_PV,
-        index + 1,
-        15,
-        text
-    );
-}
-
-/* =========================================================
- * SOLAR POWER MODEL
- * ========================================================= */
-
-#define PANEL_RATED_POWER      6600.0f
-#define TEMP_COEFFICIENT       0.00354f
-#define STC_TEMPERATURE        25.0f
-
-/* =========================================================
- * DUST INDEX
- * ========================================================= */
-
-static void send_avg_dust(float avg_dust)
-{
-    char text[32];
-
-    snprintf(text,
-             sizeof(text),
-             "AVG_DUST:%.1f",
-             avg_dust);
-
-    send_text_packet(
-        NRF24_PACKET_TYPE_SOLAR_PV,
-        14,
-        15,
-        text
-    );
-}
-
-/* =========================================================
- * SOLAR POWER
- * ========================================================= */
-
-static void send_total_power(float power)
-{
-    char text[32];
-
-    snprintf(text,
-             sizeof(text),
-             "POWER:%.1fW",
-             power);
-
-    send_text_packet(
-        NRF24_PACKET_TYPE_SOLAR_PV,
-        15,
-        15,
-        text
-    );
-}
-
-/* =========================================================
- * MAIN
- * ========================================================= */
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "System Starting");
 
-    /* ---------------- I2C ---------------- */
-
     i2c_master_init();
 
-    /* ---------------- SHT30 ---------------- */
-
     if (sht30_init() != ESP_OK) {
-
-        ESP_LOGE(TAG,
-                 "SHT30 init failed");
-
+        ESP_LOGE(TAG, "SHT30 init failed");
         return;
     }
-
-    /* ---------------- VEML6030 ---------------- */
 
     if (veml6030_init() != ESP_OK) {
-
-        ESP_LOGE(TAG,
-                 "VEML6030 init failed");
-
+        ESP_LOGE(TAG, "VEML6030 init failed");
         return;
     }
-
-    /* ---------------- NTC ---------------- */
 
     ntc_init();
 
-    /* ---------------- NRF24 ---------------- */
-
     if (!nrf24_init_tx()) {
-
-        ESP_LOGE(TAG,
-                 "NRF24 init failed");
-
+        ESP_LOGE(TAG, "NRF24 init failed");
         return;
     }
 
-    ESP_LOGI(TAG,
-             "All modules initialized");
+    ESP_LOGI(TAG, "All modules initialized");
 
-    /* =====================================================
-     * LOOP
-     * ===================================================== */
-
-    while (1)
-    {
+    while (1) {
         float ambient_temp = 0.0f;
-
         float humidity = 0.0f;
-
         float lux = 0.0f;
-
         float irradiance = 0.0f;
-
+        float total_power = 0.0f;
+        float total_dust = 0.0f;
+        int valid_panels = 0;
         uint16_t raw = 0;
 
-        printf("\n");
-
-        printf("========================================\n");
+        printf("\n========================================\n");
         printf("         SOLAR PV TRANSMITTER\n");
         printf("========================================\n");
 
-        /* =====================================
-         * SHT30
-         * ===================================== */
-
-        if (sht30_read(&ambient_temp,
-                       &humidity) == ESP_OK)
-        {
-            printf("Ambient Temp : %.2f C\n",
-                   ambient_temp);
-
-            printf("Humidity     : %.2f %%\n",
-                   humidity);
-
-            send_environment_data(
-                ambient_temp,
-                humidity
-            );
-        }
-        else
-        {
+        if (sht30_read(&ambient_temp, &humidity) == ESP_OK) {
+            printf("Ambient Temp : %.2f C\n", ambient_temp);
+            printf("Humidity     : %.2f %%\n", humidity);
+        } else {
             printf("SHT30 READ FAILED\n");
         }
 
-        /* =====================================
-         * VEML6030
-         * ===================================== */
-
-        if (veml6030_read_lux(&lux) == ESP_OK)
-        {
+        if (veml6030_read_lux(&lux) == ESP_OK) {
             veml6030_read_raw(&raw);
-
             irradiance = lux / 120.0f;
-
-            printf("Lux          : %.2f\n",
-                   lux);
-
-            printf("Irradiance   : %.2f\n",
-                   irradiance);
-
-            send_light_data(
-                lux,
-                irradiance
-            );
-        }
-        else
-        {
+            printf("Lux          : %.2f\n", lux);
+            printf("Irradiance   : %.2f W/m2\n", irradiance);
+        } else {
             printf("VEML6030 READ FAILED\n");
         }
 
         printf("----------------------------------------\n");
 
-/* =====================================
- * NTC LOOP
- * ===================================== */
+        for (int i = 0; i < NUM_NTC; i++) {
+            uint32_t mv = 0;
+            float measured_temp = ntc_read_temperature(i, &mv);
 
-float total_power = 0.0f;
-float total_dust  = 0.0f;
+            if (isnan(measured_temp)) {
+                printf("PV%d : FAULT\n", i + 1);
+                send_panel_packet((uint8_t)(i + 1),
+                                  NRF24_SOLAR_FAULT_FLAG,
+                                  0.0f,
+                                  0.0f,
+                                  0.0f,
+                                  0.0f,
+                                  0.0f,
+                                  ambient_temp,
+                                  humidity,
+                                  irradiance);
+                continue;
+            }
 
-int valid_panels = 0;
+            float delta_t = ml_predict(lux, measured_temp, ambient_temp);
+            float predicted_temp = ambient_temp + delta_t;
+            float dust_index = calculate_dust_index(measured_temp, predicted_temp);
+            float panel_power = calculate_solar_power(irradiance, measured_temp, dust_index);
 
-float pv_temp[NUM_NTC];
-float pv_pred[NUM_NTC];
-float pv_delta[NUM_NTC];
-float pv_dust[NUM_NTC];
+            total_power += panel_power;
+            total_dust += dust_index;
+            valid_panels++;
 
-printf("----------------------------------------\n");
+            printf("PV%d : %.2f C | Pred %.2f C | dT %.2f C | Dust %.2f %% | P %.2f W\n",
+                   i + 1,
+                   measured_temp,
+                   predicted_temp,
+                   delta_t,
+                   dust_index,
+                   panel_power);
 
-for (int i = 0; i < NUM_NTC; i++)
-{
-    uint32_t mv = 0;
+            send_panel_packet((uint8_t)(i + 1),
+                              0x00,
+                              measured_temp,
+                              predicted_temp,
+                              delta_t,
+                              dust_index,
+                              panel_power,
+                              ambient_temp,
+                              humidity,
+                              irradiance);
+        }
 
-    float measured_temp =
-        ntc_read_temperature(i, &mv);
+        float avg_dust = (valid_panels > 0) ? (total_dust / valid_panels) : 0.0f;
 
-    if (isnan(measured_temp))
-    {
-        pv_temp[i]  = NAN;
-        pv_pred[i]  = NAN;
-        pv_delta[i] = NAN;
-        pv_dust[i]  = NAN;
-        continue;
-    }
+        printf("----------------------------------------\n");
+        printf("Avg Dust Index        : %.2f %%\n", avg_dust);
+        printf("P_out Solar           : %.2f W\n", total_power);
+        printf("Valid Solar Probes    : %d / %d\n", valid_panels, NUM_NTC);
+        printf("========================================\n");
 
-    float deltaT =
-        ml_predict(
-            lux,
-            measured_temp,
-            ambient_temp
-        );
-
-    float predicted_temp =
-        ambient_temp + deltaT;
-
-    float dust_index =
-        calculate_dust_index(
-            measured_temp,
-            predicted_temp
-        );
-
-    float panel_power =
-        calculate_solar_power(
-            irradiance,
-            measured_temp,
-            dust_index
-        );
-
-    pv_temp[i]  = measured_temp;
-    pv_pred[i]  = predicted_temp;
-    pv_delta[i] = deltaT;
-    pv_dust[i]  = dust_index;
-
-    total_power += panel_power;
-    total_dust  += dust_index;
-
-    valid_panels++;
-
-    send_ntc_data(
-    (uint8_t)(i + 1),
-    measured_temp,
-    predicted_temp,
-    deltaT,
-    dust_index
-);
-}
-/* =====================================
- * OVERALL VALUES
- * ===================================== */
-
-float avg_dust = 0.0f;
-send_avg_dust(avg_dust);
-
-send_total_power(total_power);
-if (valid_panels > 0)
-{
-    avg_dust = total_dust / valid_panels;
-}
-
-printf("\n");
-
-printf("SHT30 : Temperature = %.2f C, Humidity = %.2f %%\n",
-       ambient_temp,
-       humidity);
-
-printf("Lux : %.2f , Irradiance : %.2f\n",
-       lux,
-       irradiance);
-
-printf("Avg Dust Index : %.2f %%\n",
-       avg_dust);
-
-printf("Estimated Solar Power : %.2f W\n",
-       total_power);
-
-printf("\n");
-
-for (int i = 0; i < NUM_NTC; i++)
-{
-    if (isnan(pv_temp[i]))
-    {
-        printf("PV%d = FAULT\n",
-               i + 1);
-    }
-    else
-    {
-        printf(
-            "PV%d = %.2f | Predicted = %.2f | Delta_T = %.2f | Dust = %.2f %%\n",
-            i + 1,
-            pv_temp[i],
-            pv_pred[i],
-            pv_delta[i],
-            pv_dust[i]
-        );
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
-
-printf("========================================\n");
-
-vTaskDelay(pdMS_TO_TICKS(2000));
-
-    }   /* while(1) */
-
-}       /* app_main() */
