@@ -18,5 +18,6 @@
     "--compile-commands-dir=d:\\Solar_PV\\build"
   ],
   "idf.flashType": "UART",
-  "idf.currentSetup": "C:\\Users\\aayus\\esp\\v5.5.2\\esp-idf"
+  "idf.currentSetup": "C:\\Users\\aayus\\esp\\v5.5.2\\esp-idf",
+  "idf.port": "COM6"
 }
